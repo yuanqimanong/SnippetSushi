@@ -13,7 +13,7 @@ from urllib.parse import urlparse, quote, unquote
 
 import pymysql
 from dbutils.pooled_db import PooledDB
-from pymysql import Connection
+from pymysql import Connection, Error, connect, OperationalError, ProgrammingError
 from pymysql.cursors import DictCursor, Cursor, SSDictCursor, SSCursor
 
 
@@ -22,7 +22,7 @@ def handle_errors(func):
     def wrapper(self, *args, **kwargs):
         try:
             return func(self, *args, **kwargs)
-        except pymysql.Error as pe:
+        except Error as pe:
             self.logger.error(f"数据库操作失败: {pe}")
             self.conn.rollback()
             raise pe
@@ -45,7 +45,7 @@ class DBJSONEncoder(JSONEncoder):
 class DBOperator:
 
     def __init__(
-        self, conn: Connection, table_name: str = None, autocommit: bool = True
+            self, conn: Connection, table_name: str = None, autocommit: bool = True
     ):
         self.logger = logging.getLogger(__name__)
         self.conn = conn
@@ -71,7 +71,7 @@ class DBOperator:
 
     @handle_errors
     def query_fields(
-        self, table_name: str = None, full_info=False
+            self, table_name: str = None, full_info=False
     ) -> list[Union[str, dict]]:
         """查询表字段信息
 
@@ -96,17 +96,17 @@ class DBOperator:
 
     @handle_errors
     def insert(
-        self,
-        *,
-        table_name: str = None,
-        data: Union[Dict, list[Dict]],
-        batch_size: int = 100,
-        ignore_duplicate: bool = True,
-        insert_ignore: bool = False,
+            self,
+            *,
+            table_name: str = None,
+            data: Union[Dict, list[Dict]],
+            batch_size: int = 100,
+            ignore_duplicate: bool = True,
+            insert_ignore: bool = False,
     ) -> int:
         """插入数据"""
-        # TODO 批量插入字段未对齐，性能优化改写 yield方式
         _table_name = table_name or self.table_name
+        _table_name = f"`{_table_name.replace('`', '')}`"
         _data = copy.deepcopy(data)
 
         if isinstance(_data, Dict):
@@ -143,15 +143,16 @@ class DBOperator:
 
     @handle_errors
     def update(
-        self,
-        *,
-        table_name: str = None,
-        data: Dict,
-        conditions: Dict = None,
-        where_sql: str = None,
+            self,
+            *,
+            table_name: str = None,
+            data: Dict,
+            conditions: Dict = None,
+            where_sql: str = None,
     ) -> int:
         """更新数据"""
         _table_name = table_name or self.table_name
+        _table_name = f"`{_table_name.replace('`', '')}`"
 
         with self.conn.cursor() as cursor:
             params = list(data.values())
@@ -175,15 +176,16 @@ class DBOperator:
 
     @handle_errors
     def upsert(
-        self,
-        *,
-        table_name: str = None,
-        data: Union[Dict, list[Dict]],
-        batch_size: int = 100,
-        update_fields: List[str] = None,
+            self,
+            *,
+            table_name: str = None,
+            data: Union[Dict, list[Dict]],
+            batch_size: int = 100,
+            update_fields: List[str] = None,
     ) -> int:
         """更新插入操作"""
         _table_name = table_name or self.table_name
+        _table_name = f"`{_table_name.replace('`', '')}`"
         _data = copy.deepcopy(data)
 
         if isinstance(_data, Dict):
@@ -193,7 +195,7 @@ class DBOperator:
         if len(_data) > 0:
             with self.conn.cursor() as cursor:
                 for sql, params in self.generate_upsert_sql(
-                    _table_name, _data, batch_size, update_fields
+                        _table_name, _data, batch_size, update_fields
                 ):
                     self.logger.debug(f"执行SQL:  {sql} \n params:  {params}")
                     cursor.executemany(sql, params)
@@ -203,11 +205,11 @@ class DBOperator:
         return rowcount
 
     def generate_upsert_sql(
-        self,
-        table_name: str,
-        data: list[Dict],
-        batch_size: int,
-        update_fields: List[str],
+            self,
+            table_name: str,
+            data: list[Dict],
+            batch_size: int,
+            update_fields: List[str],
     ):
 
         data_columns_dict = self.get_data_columns_list(data)
@@ -234,16 +236,61 @@ class DBOperator:
             data_columns_dict[key].append(item)
         return data_columns_dict
 
-    # @handle_errors
-    # def delete(self, table_name: str, conditions: Dict) -> int:
-    #     """删除数据"""
-    #     with self.conn.cursor() as cursor:
-    #         where_clause = " AND ".join([f"{k}=%s" for k in conditions.keys()])
-    #         sql = f"DELETE FROM {table_name} WHERE {where_clause}"
-    #         affected = cursor.execute(sql, tuple(conditions.values()))
-    #         if self.autocommit:
-    #             self.conn.commit()
-    #         return affected
+    @handle_errors
+    def delete(
+            self,
+            *,
+            table_name: str = None,
+            conditions: Dict = None,
+            where_sql: str = None,
+            allow_delete_all: bool = False,
+    ) -> int:
+        """删除数据"""
+        _table_name = table_name or self.table_name
+        _table_name = f"`{_table_name.replace('`', '')}`"
+
+        is_full_delete = not conditions and not where_sql
+        if is_full_delete and not allow_delete_all:
+            user_input = input(
+                "注意：是否确认删除全表？确认请输入“yes”后回车，输入其他则不执行删除操作！"
+            )
+            if user_input.lower() != "yes":
+                return 0
+
+        with self.conn.cursor() as cursor:
+            if conditions:
+                where_clause = " AND ".join([f"`{k}`=%s" for k in conditions.keys()])
+                sql = f"DELETE FROM {_table_name} WHERE {where_clause}"
+                affected = cursor.execute(sql, tuple(conditions.values()))
+            elif where_sql:
+                affected = cursor.execute(
+                    f"DELETE FROM {_table_name} WHERE {where_sql}"
+                )
+            else:
+                sql = f"DELETE FROM {_table_name}"
+                affected = cursor.execute(sql)
+
+            if self.autocommit:
+                self.conn.commit()
+            return affected
+
+    @handle_errors
+    def truncate_table(self, *, table_name: str = None) -> int:
+        _table_name = table_name or self.table_name
+        _table_name = f"`{_table_name.replace('`', '')}`"
+        try:
+            with self.conn.cursor() as cursor:
+                sql = f"TRUNCATE FROM {_table_name}"
+                affected = cursor.execute(sql)
+
+                if self.autocommit:
+                    self.conn.commit()
+                return affected
+        except (OperationalError, ProgrammingError) as e:
+            if any(keyword in str(e).lower() for keyword in ["denied", "permission"]):
+                self.logger.error(f"`{_table_name}` 缺少 TRUNCATE 权限！错误详情：{e}")
+            else:
+                raise
 
 
 db_url_pattern = re.compile(
@@ -252,7 +299,6 @@ db_url_pattern = re.compile(
 
 
 class MySQLHelper:
-
     CURSOR_CLASS_MAP = {
         "cursor": Cursor,
         "Cursor": Cursor,
@@ -263,18 +309,18 @@ class MySQLHelper:
         "ss_dict_cursor": SSDictCursor,
         "SSDictCursor": SSDictCursor,
     }
-    pymysql_connect_args = list(inspect.signature(pymysql.connect).parameters.keys())
+    pymysql_connect_args = list(inspect.signature(connect).parameters.keys())
     _connection_list = {}
 
     def __init__(
-        self,
-        *,
-        db_url: str = None,
-        db_config: Dict[str, Any] = None,
-        cursor_class: str = None,
-        table_name: str = None,
-        autocommit: bool = True,
-        **kwargs,
+            self,
+            *,
+            db_url: str = None,
+            db_config: Dict[str, Any] = None,
+            cursor_class: str = None,
+            table_name: str = None,
+            autocommit: bool = True,
+            **kwargs,
     ):
         """
         初始化 MySQLHelper 实例
@@ -307,7 +353,7 @@ class MySQLHelper:
 
     @staticmethod
     def _set_cursor_class(
-        cursor_class: Union[str, Cursor, DictCursor, SSCursor, SSDictCursor],
+            cursor_class: Union[str, Cursor, DictCursor, SSCursor, SSDictCursor],
     ) -> Type[Union[DictCursor, Cursor, SSCursor, SSDictCursor]]:
         if not cursor_class:
             return DictCursor
